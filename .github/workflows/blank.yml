@@ -1,0 +1,66 @@
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Accept header inspection
+    const acceptHeader = request.headers.get('Accept') || '';
+    
+    // Determine the optimal image format supported by the user's browser
+    let targetFormat = 'origin'; // Fallback to original image format (JPEG/PNG)
+    if (acceptHeader.includes('image/avif')) {
+      targetFormat = 'avif'; // Up to 80% smaller than JPEG
+    } else if (acceptHeader.includes('image/webp')) {
+      targetFormat = 'webp'; // Up to 60% smaller than JPEG
+    }
+
+    // Construct image transformation options for Cloudflare Edge Engine
+    const imageOptions = {
+      format: targetFormat === 'origin' ? undefined : targetFormat,
+      quality: targetFormat === 'avif' ? 65 : 75, // Optimal visual balance for manhwa panels
+      width: 1200, // Clamp maximum width for ultra-high-res vertical panels
+      fit: 'scale-down',
+    };
+
+    // Cache key includes browser format so WebP and AVIF cached copies don't collide
+    const cacheKey = new Request(`${url.toString()}?format=${targetFormat}`, request);
+    const cache = caches.default;
+
+    // 1. Check if compressed version is already cached at the Cloudflare PoP
+    let response = await cache.match(cacheKey);
+    if (response) {
+      return response;
+    }
+
+    // 2. Fetch original image from R2 storage with Cloudflare Image Resizing options
+    const originUrl = `https://${env.R2_PUBLIC_DOMAIN}${url.pathname}`;
+    
+    response = await fetch(originUrl, {
+      cf: {
+        image: imageOptions, // Triggers Cloudflare's on-the-fly compression engine
+        cacheEverything: true,
+        cacheTtl: 31536000, // Cache compressed result for 1 year
+      },
+    });
+
+    // Handle fallbacks if Cloudflare Image Resizing fails or is not enabled on origin
+    if (!response.ok) {
+      response = await fetch(originUrl);
+    }
+
+    // 3. Clone and add response headers for client caching and browser format selection
+    const headers = new Headers(response.headers);
+    headers.set('Vary', 'Accept'); // Essential: Tells browsers/CDNs that response depends on Accept header
+    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    headers.set('X-Converted-Format', targetFormat);
+
+    const finalResponse = new Response(response.body, {
+      status: response.status,
+      headers: headers,
+    });
+
+    // Save compressed variant into Cloudflare's Edge Cache
+    ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+
+    return finalResponse;
+  },
+};
